@@ -103,6 +103,7 @@ enum AuthStorePopulationPlanner {
         )
         let folderName = AuthStoreDestinationPlanner.buildManagedFolderName(
             baseLabel: baseLabel,
+            accountType: liveStatus.planType ?? record.planType,
             parsedFolderName: record.parsedFolderName,
             now: now,
             calendar: calendar

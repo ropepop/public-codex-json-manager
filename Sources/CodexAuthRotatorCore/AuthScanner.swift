@@ -38,6 +38,7 @@ public struct AuthScanner: Sendable {
             let relativeComponents = relativeFolderPath.split(separator: "/").map(String.init)
             let topLevel = relativeComponents.first ?? folderName
             let parsedFolder = FolderNameParser.parse(folderName)
+            let folderAccountType = FolderNameParser.normalizedAccountType(parsedFolder.accountType)
             let folderIdentity = FolderNameParser.inferIdentity(
                 topLevelFolderName: topLevel,
                 baseLabel: parsedFolder.baseLabel
@@ -70,7 +71,7 @@ public struct AuthScanner: Sendable {
                     trackingKey: resolvedIdentity.trackingKey,
                     accountID: resolvedIdentity.accountID,
                     authFingerprint: fingerprint,
-                    planType: resolvedIdentity.planType,
+                    planType: folderAccountType ?? resolvedIdentity.planType,
                     lastRefreshAt: Self.parseLastRefreshDate(from: payload.lastRefresh),
                     authFileModifiedAt: authFileModifiedAt,
                     pathEmail: pathEmail,

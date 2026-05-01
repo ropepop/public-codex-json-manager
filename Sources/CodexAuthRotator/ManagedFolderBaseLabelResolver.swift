@@ -52,11 +52,7 @@ enum ManagedFolderBaseLabelResolver {
             return kindLabel
         }
 
-        if currentBaseLabel.localizedCaseInsensitiveContains(kindLabel) || containsKnownKindToken(currentBaseLabel) {
-            return AuthStoreDestinationPlanner.sanitizedPathComponent(currentBaseLabel)
-        }
-
-        return AuthStoreDestinationPlanner.sanitizedPathComponent("\(currentBaseLabel) \(kindLabel)")
+        return AuthStoreDestinationPlanner.sanitizedPathComponent(currentBaseLabel)
     }
 
     static func fallbackBaseLabel(for record: ScannedAuthRecord) -> String {
@@ -81,16 +77,6 @@ enum ManagedFolderBaseLabelResolver {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         return normalizedValue == "account" || normalizedValue.hasPrefix("account-")
-    }
-
-    private static func containsKnownKindToken(_ value: String) -> Bool {
-        let knownTokens: Set<String> = ["free", "personal", "team", "workplace"]
-        let tokens = value
-            .lowercased()
-            .split { !$0.isLetter && !$0.isNumber }
-            .map(String.init)
-
-        return tokens.contains(where: knownTokens.contains)
     }
 
     private static func normalizedNonEmpty(_ value: String?) -> String? {

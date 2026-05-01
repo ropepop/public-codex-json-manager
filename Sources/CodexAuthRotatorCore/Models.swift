@@ -45,6 +45,7 @@ public struct StoredAuthPayload: Codable, Hashable, Sendable {
 public struct ParsedFolderName: Hashable, Sendable {
     public let original: String
     public let baseLabel: String
+    public let accountType: String?
     public let shortWindowUsage: Int?
     public let shortWindowResetToken: String?
     public let weeklyUsage: Int?
@@ -53,6 +54,7 @@ public struct ParsedFolderName: Hashable, Sendable {
     public init(
         original: String,
         baseLabel: String,
+        accountType: String? = nil,
         shortWindowUsage: Int?,
         shortWindowResetToken: String?,
         weeklyUsage: Int?,
@@ -60,6 +62,7 @@ public struct ParsedFolderName: Hashable, Sendable {
     ) {
         self.original = original
         self.baseLabel = baseLabel
+        self.accountType = accountType
         self.shortWindowUsage = shortWindowUsage
         self.shortWindowResetToken = shortWindowResetToken
         self.weeklyUsage = weeklyUsage
@@ -590,10 +593,13 @@ public enum FolderNameParser {
             }
         }
 
+        let accountType = trailingAccountType(in: workingTokens)
+
         guard strippedManagedSuffix else {
             return ParsedFolderName(
                 original: folderName,
                 baseLabel: trimmed,
+                accountType: accountType,
                 shortWindowUsage: nil,
                 shortWindowResetToken: nil,
                 weeklyUsage: nil,
@@ -606,6 +612,7 @@ public enum FolderNameParser {
         return ParsedFolderName(
             original: folderName,
             baseLabel: base,
+            accountType: accountType,
             shortWindowUsage: capturedShortWindowUsage,
             shortWindowResetToken: capturedShortResetToken,
             weeklyUsage: capturedWeeklyUsage,
@@ -655,6 +662,7 @@ public enum FolderNameParser {
 
     public static func buildFolderName(
         baseLabel: String,
+        accountType: String? = nil,
         shortWindowUsage: Int?,
         shortWindowResetAt: Date?,
         weeklyUsage: Int?,
@@ -662,7 +670,12 @@ public enum FolderNameParser {
         now: Date,
         calendar: Calendar = .current
     ) -> String {
-        let trimmedBase = baseLabel.trimmingWhitespace()
+        let normalizedAccountType = normalizedAccountType(accountType)
+        let trimmedBase = if normalizedAccountType == nil {
+            baseLabel.trimmingWhitespace()
+        } else {
+            baseLabelRemovingTrailingAccountType(baseLabel)
+        }
         let normalizedShortWindowUsage = normalizedManagedUsage(
             shortWindowUsage,
             keepsZeroWhenResetAtKnown: shortWindowResetAt != nil
@@ -672,11 +685,14 @@ public enum FolderNameParser {
             keepsZeroWhenResetAtKnown: weeklyResetAt != nil
         )
 
-        guard normalizedShortWindowUsage != nil || normalizedWeeklyUsage != nil else {
+        guard normalizedAccountType != nil || normalizedShortWindowUsage != nil || normalizedWeeklyUsage != nil else {
             return trimmedBase
         }
 
         var pieces = [trimmedBase].filter { !$0.isEmpty }
+        if let normalizedAccountType {
+            pieces.append(normalizedAccountType)
+        }
         if let normalizedShortWindowUsage {
             pieces.append("5hr\(normalizedShortWindowUsage)")
             if let shortWindowResetAt {
@@ -694,6 +710,7 @@ public enum FolderNameParser {
 
     public static func buildFolderName(
         baseLabel: String,
+        accountType: String? = nil,
         weeklyUsage: Int?,
         weeklyResetAt: Date?,
         now: Date,
@@ -701,6 +718,7 @@ public enum FolderNameParser {
     ) -> String {
         buildFolderName(
             baseLabel: baseLabel,
+            accountType: accountType,
             shortWindowUsage: nil,
             shortWindowResetAt: nil,
             weeklyUsage: weeklyUsage,
@@ -748,6 +766,48 @@ public enum FolderNameParser {
             .replacingOccurrences(of: folderSafeSlash, with: ".")
             .replacingOccurrences(of: "/", with: ".")
             .trimmingWhitespace()
+    }
+
+    public static func normalizedAccountType(_ value: String?) -> String? {
+        guard let normalized = value?.trimmingWhitespace().lowercased(),
+              !normalized.isEmpty else {
+            return nil
+        }
+
+        switch normalized {
+        case "free":
+            return "free"
+        case "plus", "pro", "personal":
+            return "plus"
+        case "team", "workplace":
+            return "team"
+        default:
+            return nil
+        }
+    }
+
+    public static func baseLabelRemovingTrailingAccountType(_ value: String) -> String {
+        var tokens = value
+            .trimmingWhitespace()
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+
+        var removedAccountType = false
+        while let last = tokens.last {
+            let isCanonicalAccountType = trailingAccountType(in: [last]) != nil
+            let isLegacyAccountType = tokens.count > 1 && normalizedAccountType(last) != nil
+            guard isCanonicalAccountType || isLegacyAccountType else {
+                break
+            }
+
+            tokens.removeLast()
+            removedAccountType = true
+        }
+
+        guard removedAccountType else {
+            return value.trimmingWhitespace()
+        }
+        return tokens.joined(separator: " ").trimmingWhitespace()
     }
 
     public static func displayReset(
@@ -1028,6 +1088,19 @@ public enum FolderNameParser {
         return nil
     }
 
+    private static func trailingAccountType(in tokens: [String]) -> String? {
+        guard let token = tokens.last else {
+            return nil
+        }
+
+        switch token.trimmingWhitespace().lowercased() {
+        case "free", "plus", "team":
+            return token.trimmingWhitespace().lowercased()
+        default:
+            return nil
+        }
+    }
+
     private static func usage(from token: String, using regex: NSRegularExpression) -> Int? {
         let range = NSRange(token.startIndex..<token.endIndex, in: token)
         guard let match = regex.firstMatch(in: token, options: [], range: range),
@@ -1177,12 +1250,16 @@ public enum StatusResolver {
         let isCurrentLiveTrackingKey = liveStatus?.trackingKey == trackingKey
 
         if let liveStatus, isCurrentLiveTrackingKey, let liveSnapshot = liveStatus.snapshot {
+            let fallbackBaseLabel = fallbackRecord?.parsedFolderName.baseLabel
+            let baseLabel = liveStatus.planType == nil
+                ? fallbackBaseLabel
+                : fallbackBaseLabel.map(FolderNameParser.baseLabelRemovingTrailingAccountType)
             return status(
                 from: liveSnapshot,
                 source: liveStatus.source,
                 expectedWindows: expectedQuotaWindows(
                     planType: liveStatus.planType,
-                    baseLabel: fallbackRecord?.parsedFolderName.baseLabel
+                    baseLabel: baseLabel
                 ),
                 now: now
             )

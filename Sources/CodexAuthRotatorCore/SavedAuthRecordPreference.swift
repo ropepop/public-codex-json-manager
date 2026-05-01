@@ -80,7 +80,9 @@ public enum SavedAuthRecordPreference {
             return nil
         }
 
-        let parsedBase = FolderNameParser.parse(trimmedValue).baseLabel
+        let parsedBase = FolderNameParser.baseLabelRemovingTrailingAccountType(
+            FolderNameParser.parse(trimmedValue).baseLabel
+        )
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let range = NSRange(parsedBase.startIndex..<parsedBase.endIndex, in: parsedBase)
         guard let match = emailRegex.firstMatch(in: parsedBase, options: [], range: range),
@@ -174,7 +176,9 @@ public enum SavedAuthRecordPreference {
             return email
         }
 
-        return FolderNameParser.parse(value).baseLabel
+        return FolderNameParser.baseLabelRemovingTrailingAccountType(
+            FolderNameParser.parse(value).baseLabel
+        )
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
     }

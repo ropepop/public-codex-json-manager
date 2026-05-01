@@ -532,9 +532,7 @@ enum SidebarPresentation {
             nil
         }
         let savedPlanType = groupsByTrackingKey[trackingKey]?.primaryRecord.planType
-        let normalizedPlanType = (livePlanType ?? savedPlanType)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        let normalizedPlanType = FolderNameParser.normalizedAccountType(livePlanType ?? savedPlanType)
 
         return normalizedPlanType == "free"
     }
@@ -556,17 +554,12 @@ enum SidebarPresentation {
     }
 
     private static func accountTypeLabel(from planType: String?) -> String {
-        guard let normalizedPlanType = AuthStoreDestinationPlanner.normalizedPlanType(planType),
+        guard let normalizedPlanType = FolderNameParser.normalizedAccountType(planType),
               !normalizedPlanType.isEmpty else {
             return "Unknown"
         }
 
-        switch normalizedPlanType {
-        case "workplace":
-            return "Team"
-        default:
-            return normalizedPlanType.capitalized
-        }
+        return normalizedPlanType.capitalized
     }
 
     private static func knownPlanType(_ value: String?) -> String? {

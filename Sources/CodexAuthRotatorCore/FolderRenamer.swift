@@ -7,6 +7,7 @@ public struct FolderRenamer: Sendable {
         groups: [DuplicateGroup],
         statusesByTrackingKey: [String: AccountStatus],
         preferredBaseLabelsByRecordID: [String: String] = [:],
+        preferredAccountTypesByRecordID: [String: String] = [:],
         now: Date,
         calendar: Calendar = .current,
         liveTrackingKey: String? = nil,
@@ -40,7 +41,13 @@ public struct FolderRenamer: Sendable {
 
                 let hasManagedFolderData = record.parsedFolderName.shortWindowUsage != nil
                     || record.parsedFolderName.weeklyUsage != nil
+                let desiredAccountType = preferredAccountTypesByRecordID[record.id]
+                    ?? record.parsedFolderName.accountType
+                    ?? record.planType
+                let hasManagedAccountType = record.parsedFolderName.accountType != nil
+                    || FolderNameParser.normalizedAccountType(desiredAccountType) != nil
                 guard hasManagedFolderData
+                        || hasManagedAccountType
                         || status.shortWindowUsagePercent != nil
                         || status.weeklyUsagePercent != nil else {
                     continue
@@ -50,6 +57,7 @@ public struct FolderRenamer: Sendable {
                     for: record,
                     status: status,
                     preferredBaseLabel: preferredBaseLabelsByRecordID[record.id] ?? record.parsedFolderName.baseLabel,
+                    accountType: desiredAccountType,
                     now: now,
                     calendar: calendar
                 )
@@ -86,11 +94,21 @@ public struct FolderRenamer: Sendable {
         for record: ScannedAuthRecord,
         status: AccountStatus,
         preferredBaseLabel: String,
+        accountType: String?,
         now: Date,
         calendar: Calendar
     ) -> String {
-        var pieces = [preferredBaseLabel.trimmingCharacters(in: .whitespacesAndNewlines)]
+        let normalizedAccountType = FolderNameParser.normalizedAccountType(accountType)
+        let baseLabel = if normalizedAccountType == nil {
+            preferredBaseLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            FolderNameParser.baseLabelRemovingTrailingAccountType(preferredBaseLabel)
+        }
+        var pieces = [baseLabel]
             .filter { !$0.isEmpty }
+        if let normalizedAccountType {
+            pieces.append(normalizedAccountType)
+        }
         pieces.append(contentsOf: managedSuffixPieces(
             prefix: "5hr",
             source: status.source,

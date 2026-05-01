@@ -158,6 +158,7 @@ enum AuthStoreReconciler {
         ) ?? ManagedFolderBaseLabelResolver.fallbackBaseLabel(for: record)
         let desiredFolderName = AuthStoreDestinationPlanner.buildManagedFolderName(
             baseLabel: baseLabel,
+            accountType: liveStatus?.planType ?? record.planType,
             parsedFolderName: record.parsedFolderName,
             now: now,
             calendar: calendar

@@ -2,10 +2,25 @@ import AppKit
 import CodexAuthRotatorCore
 import Foundation
 
+typealias CodexSignInStatusUpdateHandler = @Sendable (String) async -> Void
+
 struct CodexSignInStartRequest: Sendable {
     let configURL: URL
     let codexBinary: String
     let environment: [String: String]
+    let statusUpdate: CodexSignInStatusUpdateHandler
+
+    init(
+        configURL: URL,
+        codexBinary: String,
+        environment: [String: String],
+        statusUpdate: @escaping CodexSignInStatusUpdateHandler = { _ in }
+    ) {
+        self.configURL = configURL
+        self.codexBinary = codexBinary
+        self.environment = environment
+        self.statusUpdate = statusUpdate
+    }
 }
 
 struct CodexSignInResult: Sendable {
@@ -25,6 +40,7 @@ struct CodexSignInProcessInvocation: Sendable {
     let homeDirectoryURL: URL
     let workingDirectoryURL: URL
     let authFileURL: URL
+    let statusUpdate: CodexSignInStatusUpdateHandler
 }
 
 struct CodexSignInProcessResult: Sendable {
@@ -57,6 +73,7 @@ protocol CodexSignInStarter: Sendable {
 
 enum CodexSignInStarterError: LocalizedError, Sendable {
     case terminalLaunchFailed
+    case privateSafariLaunchFailed(String)
     case processStartFailed(String)
     case interrupted
     case timedOut
@@ -68,6 +85,12 @@ enum CodexSignInStarterError: LocalizedError, Sendable {
         switch self {
         case .terminalLaunchFailed:
             return "Couldn't open a Terminal window for Codex sign-in."
+        case let .privateSafariLaunchFailed(message):
+            let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedMessage.isEmpty else {
+                return "Couldn't open a private Safari window for Codex sign-in."
+            }
+            return "Couldn't open a private Safari window for Codex sign-in: \(trimmedMessage)"
         case let .processStartFailed(message):
             return "Couldn't start Codex sign-in: \(message)"
         case .interrupted:
@@ -86,6 +109,7 @@ enum CodexSignInStarterError: LocalizedError, Sendable {
 
 struct BrowserCodexSignInStarter: CodexSignInStarter {
     typealias Runner = @Sendable (CodexSignInProcessInvocation) async throws -> CodexSignInProcessResult
+    typealias PrivateSafariOpener = @Sendable (URL) async throws -> Void
 
     private final class ProcessHandle: @unchecked Sendable {
         private let lock = NSLock()
@@ -109,6 +133,215 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
         }
     }
 
+    private final class AppServerOutputCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var output = ""
+        private var stdoutBuffer = ""
+        private var privateSafariTask: Task<Void, Never>?
+        private var privateSafariError: Error?
+        private var loginCompleted = false
+        private var loginError: Error?
+
+        func appendStdout(
+            _ data: Data,
+            statusUpdate: @escaping CodexSignInStatusUpdateHandler,
+            privateSafariOpener: @escaping PrivateSafariOpener
+        ) {
+            appendOutput(data)
+
+            guard !data.isEmpty else {
+                return
+            }
+
+            let text = String(data: data, encoding: .utf8) ?? ""
+            guard !text.isEmpty else {
+                return
+            }
+
+            lock.lock()
+            stdoutBuffer += text
+            let lines = completeStdoutLines()
+            lock.unlock()
+
+            for line in lines {
+                parseStdoutLine(
+                    line,
+                    statusUpdate: statusUpdate,
+                    privateSafariOpener: privateSafariOpener
+                )
+            }
+        }
+
+        func appendStderr(_ data: Data) {
+            appendOutput(data)
+        }
+
+        private func appendOutput(_ data: Data) {
+            guard !data.isEmpty else {
+                return
+            }
+
+            let text = String(data: data, encoding: .utf8) ?? ""
+            guard !text.isEmpty else {
+                return
+            }
+
+            lock.lock()
+            output += text
+            lock.unlock()
+        }
+
+        private func completeStdoutLines() -> [String] {
+            var lines: [String] = []
+            while let newlineIndex = stdoutBuffer.firstIndex(of: "\n") {
+                let line = String(stdoutBuffer[..<newlineIndex])
+                stdoutBuffer.removeSubrange(...newlineIndex)
+                lines.append(line)
+            }
+            return lines
+        }
+
+        private func parseStdoutLine(
+            _ line: String,
+            statusUpdate: @escaping CodexSignInStatusUpdateHandler,
+            privateSafariOpener: @escaping PrivateSafariOpener
+        ) {
+            guard let data = line.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
+            }
+
+            if isLoginStartResponse(json) {
+                if let error = json["error"] as? [String: Any] {
+                    recordLoginError(Self.error(from: error))
+                    return
+                }
+
+                guard let result = json["result"] as? [String: Any],
+                      let type = result["type"] as? String,
+                      type == "chatgpt",
+                      let rawURL = result["authUrl"] as? String,
+                      let url = URL(string: rawURL) else {
+                    recordLoginError(CodexSignInStarterError.processFailed(status: "unexpected login response"))
+                    return
+                }
+
+                startPrivateSafariIfNeeded(
+                    url: url,
+                    statusUpdate: statusUpdate,
+                    privateSafariOpener: privateSafariOpener
+                )
+                return
+            }
+
+            guard json["method"] as? String == "account/login/completed",
+                  let params = json["params"] as? [String: Any] else {
+                return
+            }
+
+            if params["success"] as? Bool == true {
+                lock.lock()
+                loginCompleted = true
+                lock.unlock()
+            } else {
+                let message = params["error"] as? String ?? "Login was not completed."
+                recordLoginError(CodexSignInStarterError.processFailed(status: message))
+            }
+        }
+
+        private func startPrivateSafariIfNeeded(
+            url: URL,
+            statusUpdate: @escaping CodexSignInStatusUpdateHandler,
+            privateSafariOpener: @escaping PrivateSafariOpener
+        ) {
+            lock.lock()
+            let shouldStart = privateSafariTask == nil
+            if shouldStart {
+                privateSafariTask = Task {
+                    await statusUpdate("Complete sign-in in Safari Private Browsing.")
+                    do {
+                        try await privateSafariOpener(url)
+                    } catch {
+                        self.recordPrivateSafariError(error)
+                    }
+                }
+            }
+            lock.unlock()
+        }
+
+        func collectedOutput() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return output
+        }
+
+        func loginCompletionError() -> Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return loginError
+        }
+
+        func hasCompletedLogin() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return loginCompleted
+        }
+
+        func privateSafariFailure() -> Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return privateSafariError
+        }
+
+        func waitForPrivateSafariOpen() async throws {
+            await currentPrivateSafariTask()?.value
+
+            if let error = privateSafariFailure() {
+                throw error
+            }
+        }
+
+        private func currentPrivateSafariTask() -> Task<Void, Never>? {
+            lock.lock()
+            defer { lock.unlock() }
+            return privateSafariTask
+        }
+
+        private func recordPrivateSafariError(_ error: Error) {
+            lock.lock()
+            privateSafariError = error
+            lock.unlock()
+        }
+
+        private func recordLoginError(_ error: Error) {
+            lock.lock()
+            loginError = error
+            lock.unlock()
+        }
+
+        private func isLoginStartResponse(_ json: [String: Any]) -> Bool {
+            switch json["id"] {
+            case let value as Int:
+                return value == Self.loginStartRequestID
+            case let value as Double:
+                return value == Double(Self.loginStartRequestID)
+            case let value as String:
+                return value == String(Self.loginStartRequestID)
+            default:
+                return false
+            }
+        }
+
+        private static func error(from json: [String: Any]) -> Error {
+            if let message = json["message"] as? String {
+                return CodexSignInStarterError.processFailed(status: message)
+            }
+            return CodexSignInStarterError.processFailed(status: "unknown app-server login error")
+        }
+
+        private static let loginStartRequestID = 2
+    }
+
     private static let defaultFallbackCodexBinaryPaths = [
         "/Applications/Codex.app/Contents/Resources/codex",
         "/Applications/Codex Beta.app/Contents/Resources/codex",
@@ -116,18 +349,26 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
 
     let timeout: TimeInterval
     let fallbackCodexBinaryPaths: [String]
+    let privateSafariOpener: PrivateSafariOpener
     let runner: Runner
 
     init(
         timeout: TimeInterval = 20 * 60,
         fallbackCodexBinaryPaths: [String] = defaultFallbackCodexBinaryPaths,
+        privateSafariOpener: PrivateSafariOpener? = nil,
         runner: Runner? = nil
     ) {
         let resolvedTimeout = max(1, timeout)
+        let resolvedPrivateSafariOpener = privateSafariOpener ?? Self.openInPrivateSafari
         self.timeout = resolvedTimeout
         self.fallbackCodexBinaryPaths = fallbackCodexBinaryPaths
+        self.privateSafariOpener = resolvedPrivateSafariOpener
         self.runner = runner ?? { invocation in
-            try await Self.runProcess(invocation: invocation, timeout: resolvedTimeout)
+            try await Self.runProcess(
+                invocation: invocation,
+                timeout: resolvedTimeout,
+                privateSafariOpener: resolvedPrivateSafariOpener
+            )
         }
     }
 
@@ -170,12 +411,13 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
                     environment: environment,
                     fallbackCodexBinaryPaths: fallbackCodexBinaryPaths
                 ),
-                arguments: ["login"],
+                arguments: ["app-server", "--listen", "stdio://"],
                 environment: environment,
                 temporaryRootURL: temporaryRootURL,
                 homeDirectoryURL: homeDirectoryURL,
                 workingDirectoryURL: workDirectoryURL,
-                authFileURL: authFileURL
+                authFileURL: authFileURL,
+                statusUpdate: request.statusUpdate
             )
             let processResult = try await runner(invocation)
             guard processResult.succeeded else {
@@ -196,9 +438,11 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
 
     private static func runProcess(
         invocation: CodexSignInProcessInvocation,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        privateSafariOpener: @escaping PrivateSafariOpener
     ) async throws -> CodexSignInProcessResult {
         let processHandle = ProcessHandle()
+        let outputCollector = AppServerOutputCollector()
 
         return try await withTaskCancellationHandler(operation: {
             let process = Process()
@@ -215,15 +459,86 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
 
+            stdoutPipe.fileHandleForReading.readabilityHandler = { fileHandle in
+                outputCollector.appendStdout(
+                    fileHandle.availableData,
+                    statusUpdate: invocation.statusUpdate,
+                    privateSafariOpener: privateSafariOpener
+                )
+            }
+            stderrPipe.fileHandleForReading.readabilityHandler = { fileHandle in
+                outputCollector.appendStderr(fileHandle.availableData)
+            }
+
             do {
                 try process.run()
-                try? inputPipe.fileHandleForWriting.close()
+                try sendAppServerRequest(
+                    [
+                        "method": "initialize",
+                        "id": 1,
+                        "params": [
+                            "clientInfo": [
+                                "name": "CodexAuthRotator",
+                                "title": "Codex Auth Rotator",
+                                "version": "0",
+                            ],
+                            "capabilities": [
+                                "experimentalApi": true,
+                            ],
+                        ],
+                    ],
+                    to: inputPipe
+                )
+                try sendAppServerRequest(
+                    [
+                        "method": "initialized",
+                    ],
+                    to: inputPipe
+                )
+                try sendAppServerRequest(
+                    [
+                        "method": "account/login/start",
+                        "id": 2,
+                        "params": [
+                            "type": "chatgpt",
+                            "codexStreamlinedLogin": false,
+                        ],
+                    ],
+                    to: inputPipe
+                )
             } catch {
                 throw CodexSignInStarterError.processStartFailed(error.localizedDescription)
             }
 
             let deadline = Date().addingTimeInterval(timeout)
             while process.isRunning, Date() < deadline {
+                if let privateSafariFailure = outputCollector.privateSafariFailure() {
+                    processHandle.terminate()
+                    process.waitUntilExit()
+                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                    stderrPipe.fileHandleForReading.readabilityHandler = nil
+                    throw privateSafariFailure
+                }
+                if let loginCompletionError = outputCollector.loginCompletionError() {
+                    processHandle.terminate()
+                    process.waitUntilExit()
+                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                    stderrPipe.fileHandleForReading.readabilityHandler = nil
+                    throw loginCompletionError
+                }
+                if outputCollector.hasCompletedLogin() || Self.authFileContainsUsableAuth(authFileURL: invocation.authFileURL) {
+                    processHandle.terminate()
+                    process.waitUntilExit()
+                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                    stderrPipe.fileHandleForReading.readabilityHandler = nil
+                    try await outputCollector.waitForPrivateSafariOpen()
+                    return CodexSignInProcessResult(
+                        status: 0,
+                        reason: .exit,
+                        output: outputCollector.collectedOutput()
+                    )
+                }
+
                 do {
                     try await Task.sleep(for: .milliseconds(100))
                 } catch {
@@ -242,27 +557,89 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
             }
 
             process.waitUntilExit()
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            outputCollector.appendStdout(
+                stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
+                statusUpdate: invocation.statusUpdate,
+                privateSafariOpener: privateSafariOpener
+            )
+            outputCollector.appendStderr(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+            try await outputCollector.waitForPrivateSafariOpen()
 
-            let stdout = String(
-                data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8
-            ) ?? ""
-            let stderr = String(
-                data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
-                encoding: .utf8
-            ) ?? ""
-            let combinedOutput = [stdout, stderr]
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n")
             return CodexSignInProcessResult(
                 status: process.terminationStatus,
                 reason: process.terminationReason == .exit ? .exit : .signal,
-                output: combinedOutput
+                output: outputCollector.collectedOutput()
             )
         }, onCancel: {
             processHandle.terminate()
         })
+    }
+
+    private static func sendAppServerRequest(_ object: [String: Any], to inputPipe: Pipe) throws {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        inputPipe.fileHandleForWriting.write(data)
+        inputPipe.fileHandleForWriting.write(Data("\n".utf8))
+    }
+
+    static func privateSafariAppleScript() -> String {
+        """
+        on run argv
+          set targetURL to item 1 of argv
+
+          tell application "Safari"
+            launch
+            activate
+          end tell
+
+          tell application "System Events"
+            repeat until exists process "Safari"
+              delay 0.05
+            end repeat
+            keystroke "n" using {shift down, command down}
+          end tell
+
+          delay 0.2
+
+          tell application "Safari"
+            set URL of front document to targetURL
+          end tell
+        end run
+        """
+    }
+
+    private static func openInPrivateSafari(_ url: URL) async throws {
+        let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", privateSafariAppleScript(), url.absoluteString]
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        do {
+            try process.run()
+        } catch {
+            throw CodexSignInStarterError.privateSafariLaunchFailed(error.localizedDescription)
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let output = String(
+                data: outputPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            let error = String(
+                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            ) ?? ""
+            let message = [output, error]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            throw CodexSignInStarterError.privateSafariLaunchFailed(message)
+        }
     }
 
     private func sanitizedEnvironment(
@@ -339,6 +716,10 @@ struct BrowserCodexSignInStarter: CodexSignInStarter {
             throw CodexSignInStarterError.unusableAuthFile
         }
         return data
+    }
+
+    private static func authFileContainsUsableAuth(authFileURL: URL) -> Bool {
+        (try? readUsableAuthData(from: authFileURL)) != nil
     }
 
     private static func copyFile(from sourceURL: URL, to destinationURL: URL) throws {

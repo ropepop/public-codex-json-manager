@@ -1798,8 +1798,8 @@ struct ContentView: View {
                         .font(.caption2.monospaced())
                         .foregroundStyle(sidebarSecondaryForeground(selected: isSelected))
 
-                    if let useLabel = group.primaryRecord.identity.useLabel, !useLabel.isEmpty {
-                        Text(useLabel)
+                    if let folderLabel = folderAccountLabel(for: group) {
+                        Text(folderLabel)
                             .font(.caption2)
                             .foregroundStyle(sidebarSecondaryForeground(selected: isSelected))
                             .lineLimit(1)
@@ -1887,8 +1887,8 @@ struct ContentView: View {
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    if let useLabel = group.primaryRecord.identity.useLabel {
-                        Text(useLabel)
+                    if let folderLabel = folderAccountLabel(for: group) {
+                        Text(folderLabel)
                             .font(.callout)
                             .foregroundStyle(sidebarSecondaryForeground(selected: isSelected))
                             .lineLimit(2)
@@ -1999,8 +1999,8 @@ struct ContentView: View {
                             Text(group.primaryRecord.identity.name)
                                 .font(.largeTitle.weight(.semibold))
 
-                            if let useLabel = group.primaryRecord.identity.useLabel {
-                                Text(useLabel)
+                            if let folderLabel = folderAccountLabel(for: group) {
+                                Text(folderLabel)
                                     .font(.title3)
                                     .foregroundStyle(.secondary)
                             }
@@ -2491,7 +2491,7 @@ struct ContentView: View {
     private func supportsShortWindow(for group: DuplicateGroup) -> Bool {
         StatusResolver.supportsShortWindow(
             planType: effectivePlanType(for: group),
-            baseLabel: group.primaryRecord.parsedFolderName.baseLabel
+            baseLabel: baseLabelForPlanEvaluation(for: group)
         )
     }
 
@@ -2506,6 +2506,36 @@ struct ContentView: View {
             return store.liveStatus?.planType ?? group.primaryRecord.planType
         }
         return group.primaryRecord.planType
+    }
+
+    private func baseLabelForPlanEvaluation(for group: DuplicateGroup) -> String {
+        let baseLabel = group.primaryRecord.parsedFolderName.baseLabel
+        guard store.liveStatus?.trackingKey == group.trackingKey,
+              store.liveStatus?.planType != nil else {
+            return baseLabel
+        }
+
+        return FolderNameParser.baseLabelRemovingTrailingAccountType(baseLabel)
+    }
+
+    private func folderAccountLabel(for group: DuplicateGroup) -> String? {
+        let rawFolderLabel = group.primaryRecord.identity.useLabel?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let accountType = FolderNameParser.normalizedAccountType(
+            group.primaryRecord.parsedFolderName.accountType ?? effectivePlanType(for: group)
+        )
+        let folderLabel = accountType == nil
+            ? rawFolderLabel
+            : rawFolderLabel.map(FolderNameParser.baseLabelRemovingTrailingAccountType)
+        let parts = [folderLabel, accountType].compactMap { value -> String? in
+            guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty else {
+                return nil
+            }
+            return trimmed
+        }
+
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
     private func saveDestinationLabel(for destination: AuthSaveDestination) -> String {

@@ -22,6 +22,64 @@ func folderParserStripsRepeatedManagedSuffixesBeforeRewriting() {
 }
 
 @Test
+func folderParserReadsTrailingAccountType() {
+    let parsed = FolderNameParser.parse("primary plus 5hr18 08.04-01:15 wk44 15.04")
+
+    #expect(parsed.baseLabel == "primary plus")
+    #expect(parsed.accountType == "plus")
+    #expect(parsed.shortWindowUsage == 18)
+    #expect(parsed.weeklyUsage == 44)
+}
+
+@Test
+func folderBuilderStoresCanonicalAccountTypeBeforeUsageSuffixes() {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    let now = Date(timeIntervalSince1970: 1_775_606_400)
+    let weeklyReset = calendar.date(from: DateComponents(year: 2026, month: 4, day: 15, hour: 12, minute: 0))!
+
+    let built = FolderNameParser.buildFolderName(
+        baseLabel: "primary personal",
+        accountType: "pro",
+        shortWindowUsage: nil,
+        shortWindowResetAt: nil,
+        weeklyUsage: 44,
+        weeklyResetAt: weeklyReset,
+        now: now,
+        calendar: calendar
+    )
+    let parsed = FolderNameParser.parse(built)
+
+    #expect(built == "primary plus wk44 15.04")
+    #expect(parsed.baseLabel == "primary plus")
+    #expect(parsed.accountType == "plus")
+    #expect(parsed.weeklyUsage == 44)
+}
+
+@Test
+func authScannerUsesFolderAccountTypeAsSavedSourceOfTruth() throws {
+    let root = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let authURL = root.appendingPathComponent("saved/primary free/auth.json")
+    try writeAuth(
+        authURL,
+        payload: authPayload(
+            accountID: "acct-folder-type",
+            tokenSeed: "folder-type",
+            userID: "user-folder-type",
+            email: "folder-type@example.com",
+            planType: "plus"
+        )
+    )
+
+    let group = try #require(AuthScanner().scan(root: root).first)
+
+    #expect(group.primaryRecord.parsedFolderName.accountType == "free")
+    #expect(group.primaryRecord.planType == "free")
+}
+
+@Test
 func folderBuilderPreservesFutureWeeklyResetClockTime() {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -771,7 +829,7 @@ func statusResolverTreatsWeeklyOnlyLiveSnapshotAsCurrentForFreePlan() {
 }
 
 @Test
-func statusResolverLetsManualFreeFolderOverridePaidLiveShortWindow() {
+func statusResolverLetsFreshLivePlanReplaceStoredFolderAccountType() {
     let now = Date(timeIntervalSince1970: 1_775_865_180) // 2026-04-11 07:13 UTC
     let shortReset = Date(timeIntervalSince1970: 1_775_883_180) // 2026-04-11 12:13 UTC
     let weeklyReset = Date(timeIntervalSince1970: 1_776_038_400) // 2026-04-13 08:00 UTC
@@ -811,8 +869,8 @@ func statusResolverLetsManualFreeFolderOverridePaidLiveShortWindow() {
     )
 
     #expect(status.source == .oauth)
-    #expect(status.shortWindowUsagePercent == nil)
-    #expect(status.shortWindowResetAt == nil)
+    #expect(status.shortWindowUsagePercent == 88)
+    #expect(status.shortWindowResetAt == shortReset)
     #expect(status.shortWindowState == .current)
     #expect(status.weeklyUsagePercent == 62)
     #expect(status.weeklyWindowState == .current)
@@ -1403,6 +1461,53 @@ func renamerUpdatesFolderNameAndSkipsCollisions() throws {
 
     #expect(report.changedPaths.count == 1)
     #expect(report.warnings.count == 1)
+}
+
+@Test
+func renamerUpdatesStoredAccountTypeFromFreshState() throws {
+    let root = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let authURL = root.appendingPathComponent("acct/primary team wk44 15.04/auth.json")
+    try writeAuth(
+        authURL,
+        payload: authPayload(
+            accountID: "acct-type-update",
+            tokenSeed: "type-update",
+            userID: "user-type-update",
+            email: "type-update@example.com",
+            planType: "team"
+        )
+    )
+
+    let calendar = utcCalendar()
+    let now = Date(timeIntervalSince1970: 1_775_606_400)
+    let group = try #require(AuthScanner().scan(root: root).first)
+    let status = AccountStatus(
+        source: .oauth,
+        capturedAt: now,
+        availableNow: true,
+        nextAvailabilityAt: nil,
+        weeklyUsagePercent: 44,
+        weeklyResetAt: Date(timeIntervalSince1970: 1_776_254_400),
+        shortWindowUsagePercent: nil,
+        shortWindowResetAt: nil,
+        rawFolderResetToken: nil,
+        weeklyWindowState: .current,
+        shortWindowState: .needsRefresh
+    )
+
+    let report = try FolderRenamer().syncManagedSuffixes(
+        groups: [group],
+        statusesByTrackingKey: [group.trackingKey: status],
+        preferredAccountTypesByRecordID: [group.primaryRecord.id: "plus"],
+        now: now,
+        calendar: calendar
+    )
+
+    #expect(report.changedPaths == ["acct/primary team wk44 15.04 -> primary plus wk44 15.04"])
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("acct/primary plus wk44 15.04/auth.json").path))
+    #expect(!FileManager.default.fileExists(atPath: authURL.path))
 }
 
 @Test

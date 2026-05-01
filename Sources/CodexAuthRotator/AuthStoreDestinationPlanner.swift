@@ -79,14 +79,18 @@ enum AuthStoreDestinationPlanner {
             : rootURL.standardizedFileURL
         let candidateParentURL = standardizedFolderURL.deletingLastPathComponent().standardizedFileURL
 
-        let candidateBaseLabel = FolderNameParser.parse(standardizedFolderURL.lastPathComponent).baseLabel
+        let candidateBaseLabel = FolderNameParser.baseLabelRemovingTrailingAccountType(
+            FolderNameParser.parse(standardizedFolderURL.lastPathComponent).baseLabel
+        )
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let expectedBaseLabel = layoutBaseLabel(
-            rootURL: rootURL,
-            liveStatus: liveStatus,
-            groups: groups,
-            fileManager: .default
+        let expectedBaseLabel = FolderNameParser.baseLabelRemovingTrailingAccountType(
+            layoutBaseLabel(
+                rootURL: rootURL,
+                liveStatus: liveStatus,
+                groups: groups,
+                fileManager: .default
+            )
         )
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -211,6 +215,7 @@ enum AuthStoreDestinationPlanner {
         )
         return FolderNameParser.buildFolderName(
             baseLabel: baseLabel,
+            accountType: liveStatus.planType,
             shortWindowUsage: status?.shortWindowUsagePercent,
             shortWindowResetAt: status?.shortWindowResetAt,
             weeklyUsage: status?.weeklyUsagePercent,
@@ -222,6 +227,7 @@ enum AuthStoreDestinationPlanner {
 
     static func buildManagedFolderName(
         baseLabel: String,
+        accountType: String? = nil,
         parsedFolderName: ParsedFolderName,
         now: Date,
         calendar: Calendar
@@ -240,6 +246,7 @@ enum AuthStoreDestinationPlanner {
 
         return FolderNameParser.buildFolderName(
             baseLabel: baseLabel,
+            accountType: accountType ?? parsedFolderName.accountType,
             shortWindowUsage: parsedFolderName.shortWindowUsage,
             shortWindowResetAt: shortResetAt,
             weeklyUsage: parsedFolderName.weeklyUsage,
