@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Auth Rotator app visual</title>
+  <desc id="desc">A native macOS-style account rotation interface with account list, quota card, and safe verification status.</desc>
+  <rect width="1600" height="900" fill="#101820"/>
+  <rect x="104" y="92" width="1392" height="716" rx="34" fill="#f8fafc"/>
+  <rect x="104" y="92" width="1392" height="76" rx="34" fill="#dbeafe"/>
+  <circle cx="152" cy="130" r="13" fill="#fb7185"/>
+  <circle cx="194" cy="130" r="13" fill="#fbbf24"/>
+  <circle cx="236" cy="130" r="13" fill="#34d399"/>
+  <text x="304" y="141" fill="#0f172a" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700">Codex Auth Rotator</text>
+
+  <rect x="132" y="196" width="360" height="574" rx="24" fill="#e2e8f0"/>
+  <text x="166" y="252" fill="#334155" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700">Saved accounts</text>
+  <rect x="166" y="292" width="292" height="76" rx="18" fill="#ffffff" stroke="#38bdf8" stroke-width="3"/>
+  <circle cx="206" cy="330" r="18" fill="#0284c7"/>
+  <text x="242" y="323" fill="#0f172a" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">Active</text>
+  <text x="242" y="351" fill="#64748b" font-family="Arial, Helvetica, sans-serif" font-size="18">5h reset visible</text>
+  <rect x="166" y="390" width="292" height="76" rx="18" fill="#f8fafc"/>
+  <circle cx="206" cy="428" r="18" fill="#14b8a6"/>
+  <text x="242" y="421" fill="#0f172a" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">Next best</text>
+  <text x="242" y="449" fill="#64748b" font-family="Arial, Helvetica, sans-serif" font-size="18">weekly room left</text>
+  <rect x="166" y="488" width="292" height="76" rx="18" fill="#f8fafc"/>
+  <circle cx="206" cy="526" r="18" fill="#a855f7"/>
+  <text x="242" y="519" fill="#0f172a" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700">Saved</text>
+  <text x="242" y="547" fill="#64748b" font-family="Arial, Helvetica, sans-serif" font-size="18">ready to rotate</text>
+
+  <rect x="548" y="222" width="408" height="254" rx="28" fill="#0f172a"/>
+  <text x="590" y="282" fill="#f8fafc" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700">Quota at a glance</text>
+  <rect x="590" y="324" width="300" height="24" rx="12" fill="#334155"/>
+  <rect x="590" y="324" width="218" height="24" rx="12" fill="#38bdf8"/>
+  <text x="590" y="386" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="22">5-hour window</text>
+  <rect x="590" y="414" width="300" height="24" rx="12" fill="#334155"/>
+  <rect x="590" y="414" width="146" height="24" rx="12" fill="#14b8a6"/>
+  <text x="590" y="466" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="22">weekly window</text>
+
+  <path d="M980 450 C1068 450 1086 450 1164 450" fill="none" stroke="#0ea5e9" stroke-width="8" stroke-linecap="round"/>
+  <path d="M1144 426 L1182 450 L1144 474 Z" fill="#0ea5e9"/>
+
+  <rect x="1208" y="260" width="220" height="320" rx="34" fill="#020617"/>
+  <text x="1254" y="342" fill="#e0f2fe" font-family="Arial, Helvetica, sans-serif" font-size="26" font-weight="700">Rotate</text>
+  <circle cx="1318" cy="436" r="62" fill="#22c55e"/>
+  <text x="1283" y="449" fill="#052e16" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="700">OK</text>
+  <text x="1238" y="542" fill="#bae6fd" font-family="Arial, Helvetica, sans-serif" font-size="21">safe verify mode</text>
+
+  <text x="136" y="842" fill="#cbd5e1" font-family="Arial, Helvetica, sans-serif" font-size="24">review saved auth files -> choose next account -> verify safely -> swap active session</text>
+</svg>
+
