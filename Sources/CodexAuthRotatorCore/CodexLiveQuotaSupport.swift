@@ -19,19 +19,22 @@ public struct CodexOAuthCredentials: Hashable, Sendable {
     public let idToken: String?
     public let accountID: String?
     public let lastRefresh: Date?
+    public let isAPIKey: Bool
 
     public init(
         accessToken: String,
         refreshToken: String,
         idToken: String?,
         accountID: String?,
-        lastRefresh: Date?
+        lastRefresh: Date?,
+        isAPIKey: Bool = false
     ) {
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.idToken = idToken
         self.accountID = accountID
         self.lastRefresh = lastRefresh
+        self.isAPIKey = isAPIKey
     }
 }
 
@@ -73,7 +76,8 @@ public enum CodexOAuthCredentialsStore {
                 refreshToken: "",
                 idToken: nil,
                 accountID: nil,
-                lastRefresh: nil
+                lastRefresh: nil,
+                isAPIKey: true
             )
         }
 
@@ -90,6 +94,48 @@ public enum CodexOAuthCredentialsStore {
             accountID: stringValue(in: tokens, snakeCaseKey: "account_id", camelCaseKey: "accountId"),
             lastRefresh: parseDate(json["last_refresh"])
         )
+    }
+
+    public static func canRefresh(_ credentials: CodexOAuthCredentials) -> Bool {
+        guard !credentials.isAPIKey else {
+            return false
+        }
+        return !credentials.refreshToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public static func writeRefreshedCredentials(
+        _ credentials: CodexOAuthCredentials,
+        to authFileURL: URL,
+        now: Date = Date()
+    ) throws {
+        guard !credentials.isAPIKey else {
+            return
+        }
+
+        let decoder = JSONDecoder()
+        let data = try Data(contentsOf: authFileURL)
+        let existingPayload = try decoder.decode(StoredAuthPayload.self, from: data)
+        let refreshedPayload = StoredAuthPayload(
+            authMode: existingPayload.authMode,
+            lastRefresh: iso8601String(from: credentials.lastRefresh ?? now),
+            tokens: AuthTokens(
+                accountID: existingPayload.tokens?.accountID ?? credentials.accountID,
+                accessToken: credentials.accessToken,
+                idToken: credentials.idToken ?? existingPayload.tokens?.idToken,
+                refreshToken: credentials.refreshToken
+            ),
+            openAIAPIKey: existingPayload.openAIAPIKey
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let refreshedData = try encoder.encode(refreshedPayload)
+        try FileManager.default.createDirectory(
+            at: authFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try refreshedData.write(to: authFileURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authFileURL.path)
     }
 
     private static func parseDate(_ raw: Any?) -> Date? {
@@ -128,6 +174,188 @@ public enum CodexOAuthCredentialsStore {
 
         return nil
     }
+
+    private static func iso8601String(from date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+}
+
+public enum CodexOAuthAccessToken {
+    public static func expirationDate(in accessToken: String) -> Date? {
+        guard let payload = jwtPayload(accessToken),
+              let exp = payload["exp"] as? TimeInterval else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: exp)
+    }
+
+    private static func jwtPayload(_ token: String) -> [String: Any]? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else {
+            return nil
+        }
+
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder > 0 {
+            payload += String(repeating: "=", count: 4 - remainder)
+        }
+
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
+    }
+}
+
+public struct CodexOAuthTokenRefreshResponse: Decodable, Sendable {
+    public let accessToken: String?
+    public let refreshToken: String?
+    public let idToken: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case idToken = "id_token"
+    }
+}
+
+public enum CodexOAuthTokenRefreshError: LocalizedError, Sendable {
+    case missingRefreshToken
+    case rejected(String?)
+    case invalidResponse(String)
+    case network(String)
+
+    public var requiresSignIn: Bool {
+        switch self {
+        case .missingRefreshToken, .rejected:
+            return true
+        case .invalidResponse, .network:
+            return false
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingRefreshToken:
+            return "Saved Codex login cannot be renewed because it has no refresh token. Please sign in again."
+        case .rejected:
+            return "Saved Codex login was rejected during renewal. Please sign in again."
+        case let .invalidResponse(message):
+            return "Codex login renewal returned an invalid response: \(message)"
+        case let .network(message):
+            return "Codex login renewal failed: \(message)"
+        }
+    }
+}
+
+public enum CodexOAuthTokenRefresher {
+    public typealias DataLoader = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
+
+    private static let refreshURL = URL(string: "https://auth.openai.com/oauth/token")!
+    private static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+    public static func refresh(
+        credentials: CodexOAuthCredentials,
+        now: Date = Date(),
+        dataLoader: DataLoader? = nil
+    ) async throws -> CodexOAuthCredentials {
+        guard CodexOAuthCredentialsStore.canRefresh(credentials) else {
+            throw CodexOAuthTokenRefreshError.missingRefreshToken
+        }
+
+        let request = try makeRequest(credentials: credentials)
+        let loader = dataLoader ?? defaultDataLoader
+
+        do {
+            let (data, response) = try await loader(request)
+            switch response.statusCode {
+            case 200 ... 299:
+                let decoded = try JSONDecoder().decode(CodexOAuthTokenRefreshResponse.self, from: data)
+                guard let accessToken = decoded.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !accessToken.isEmpty else {
+                    throw CodexOAuthTokenRefreshError.invalidResponse("Missing access token")
+                }
+                let refreshToken = decoded.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let idToken = decoded.idToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return CodexOAuthCredentials(
+                    accessToken: accessToken,
+                    refreshToken: refreshToken.flatMap { $0.isEmpty ? nil : $0 } ?? credentials.refreshToken,
+                    idToken: idToken?.isEmpty == false ? idToken : credentials.idToken,
+                    accountID: credentials.accountID,
+                    lastRefresh: now
+                )
+            case 400, 401, 403:
+                throw CodexOAuthTokenRefreshError.rejected(errorCode(from: data))
+            default:
+                throw CodexOAuthTokenRefreshError.invalidResponse("HTTP \(response.statusCode)")
+            }
+        } catch let error as CodexOAuthTokenRefreshError {
+            throw error
+        } catch _ as DecodingError {
+            throw CodexOAuthTokenRefreshError.invalidResponse("Unexpected JSON")
+        } catch {
+            throw CodexOAuthTokenRefreshError.network(error.localizedDescription)
+        }
+    }
+
+    public static func makeRequest(credentials: CodexOAuthCredentials) throws -> URLRequest {
+        guard CodexOAuthCredentialsStore.canRefresh(credentials) else {
+            throw CodexOAuthTokenRefreshError.missingRefreshToken
+        }
+
+        var request = URLRequest(url: refreshURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("CodexAuthRotator", forHTTPHeaderField: "User-Agent")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "client_id": clientID,
+            "grant_type": "refresh_token",
+            "refresh_token": credentials.refreshToken,
+            "scope": "openid profile email",
+        ])
+        return request
+    }
+
+    private static func defaultDataLoader(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CodexOAuthTokenRefreshError.invalidResponse("No HTTP response")
+        }
+        return (data, httpResponse)
+    }
+
+    private static func errorCode(from data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let error = json["error"] as? [String: Any] {
+            return stringValue(in: error, keys: ["code", "error", "message"])
+        }
+        if let error = json["error"] as? String, !error.isEmpty {
+            return error
+        }
+        return stringValue(in: json, keys: ["code", "error_description", "message"])
+    }
+
+    private static func stringValue(in dictionary: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = dictionary[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+        return nil
+    }
 }
 
 public struct CodexOAuthUsageResponse: Decodable, Sendable {
@@ -162,8 +390,9 @@ public struct CodexOAuthUsageResponse: Decodable, Sendable {
     }
 }
 
-public enum CodexOAuthFetchError: LocalizedError, Sendable {
+public enum CodexOAuthFetchError: LocalizedError, Sendable, Equatable {
     case unauthorized
+    case tokenExpired
     case invalidResponse
     case serverError(Int)
     case network(String)
@@ -172,6 +401,8 @@ public enum CodexOAuthFetchError: LocalizedError, Sendable {
         switch self {
         case .unauthorized:
             return "Codex OAuth credentials were rejected."
+        case .tokenExpired:
+            return "Codex OAuth access token expired."
         case .invalidResponse:
             return "Codex OAuth usage response was invalid."
         case let .serverError(code):
@@ -208,6 +439,9 @@ public enum CodexOAuthUsageFetcher {
                     snapshot: snapshot(from: decoded, capturedAt: now)
                 )
             case 401, 403:
+                if authErrorCode(from: data) == "token_expired" {
+                    throw CodexOAuthFetchError.tokenExpired
+                }
                 throw CodexOAuthFetchError.unauthorized
             default:
                 throw CodexOAuthFetchError.serverError(response.statusCode)
@@ -243,6 +477,32 @@ public enum CodexOAuthUsageFetcher {
         let normalizedBaseURL = normalizeBaseURL(parsedBaseURL ?? defaultBaseURL)
         return URL(string: normalizedBaseURL + "/wham/usage")
             ?? URL(string: defaultBaseURL + "/wham/usage")!
+    }
+
+    private static func authErrorCode(from data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let error = json["error"] as? [String: Any] {
+            return stringValue(in: error, keys: ["code", "error", "type", "message"])
+        }
+        if let error = json["error"] as? String {
+            let trimmed = error.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return stringValue(in: json, keys: ["code", "message", "type"])
+    }
+
+    private static func stringValue(in dictionary: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = dictionary[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+        return nil
     }
 
     private static func snapshot(from response: CodexOAuthUsageResponse, capturedAt: Date) -> QuotaSnapshot? {

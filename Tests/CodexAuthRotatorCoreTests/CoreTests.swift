@@ -1850,6 +1850,148 @@ struct CodexStatusReaderTests {
     }
 
     @Test
+    func codexOAuthUsageFetcherReportsExpiredTokensSeparately() async throws {
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access-expired",
+            refreshToken: "refresh-live",
+            idToken: nil,
+            accountID: "acct-live",
+            lastRefresh: nil
+        )
+
+        do {
+            _ = try await CodexOAuthUsageFetcher.fetchUsage(
+                credentials: credentials,
+                configURL: URL(fileURLWithPath: "/tmp/config.toml"),
+                dataLoader: { request in
+                    (
+                        Data(#"{"error":{"code":"token_expired"}}"#.utf8),
+                        HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!
+                    )
+                }
+            )
+            Issue.record("Expected expired token error.")
+        } catch let error as CodexOAuthFetchError {
+            #expect(error == .tokenExpired)
+        }
+    }
+
+    @Test
+    func codexOAuthTokenRefresherPostsRefreshTokenAndReturnsNewCredentials() async throws {
+        let now = Date(timeIntervalSince1970: 1_775_606_400)
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access-old",
+            refreshToken: "refresh-old",
+            idToken: "id-old",
+            accountID: "acct-live",
+            lastRefresh: nil
+        )
+
+        final class RequestBox: @unchecked Sendable {
+            var request: URLRequest?
+        }
+        let box = RequestBox()
+
+        let refreshed = try await CodexOAuthTokenRefresher.refresh(
+            credentials: credentials,
+            now: now,
+            dataLoader: { request in
+                box.request = request
+                return (
+                    Data(#"{"access_token":"access-new","refresh_token":"refresh-new","id_token":"id-new"}"#.utf8),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                )
+            }
+        )
+
+        let body = try #require(box.request?.httpBody)
+        let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: String])
+        #expect(box.request?.url?.absoluteString == "https://auth.openai.com/oauth/token")
+        #expect(box.request?.httpMethod == "POST")
+        #expect(json["client_id"] == "app_EMoamEEZ73f0CkXaXp7hrann")
+        #expect(json["grant_type"] == "refresh_token")
+        #expect(json["refresh_token"] == "refresh-old")
+        #expect(refreshed.accessToken == "access-new")
+        #expect(refreshed.refreshToken == "refresh-new")
+        #expect(refreshed.idToken == "id-new")
+        #expect(refreshed.accountID == "acct-live")
+        #expect(refreshed.lastRefresh == now)
+    }
+
+    @Test
+    func codexOAuthTokenRefresherFailsWhenRefreshTokenIsMissing() async {
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access-old",
+            refreshToken: "",
+            idToken: nil,
+            accountID: "acct-live",
+            lastRefresh: nil
+        )
+
+        do {
+            _ = try await CodexOAuthTokenRefresher.refresh(credentials: credentials)
+            Issue.record("Expected missing refresh token failure.")
+        } catch let error as CodexOAuthTokenRefreshError {
+            #expect(error.requiresSignIn)
+        } catch {
+            Issue.record("Expected token refresh error, got \(error.localizedDescription)")
+        }
+    }
+
+    @Test
+    func codexOAuthTokenRefresherRejectedTokenRequiresSignIn() async throws {
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access-old",
+            refreshToken: "refresh-old",
+            idToken: nil,
+            accountID: "acct-live",
+            lastRefresh: nil
+        )
+
+        do {
+            _ = try await CodexOAuthTokenRefresher.refresh(
+                credentials: credentials,
+                dataLoader: { request in
+                    (
+                        Data(#"{"error":"invalid_grant"}"#.utf8),
+                        HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!
+                    )
+                }
+            )
+            Issue.record("Expected rejected refresh token failure.")
+        } catch let error as CodexOAuthTokenRefreshError {
+            #expect(error.requiresSignIn)
+        }
+    }
+
+    @Test
+    func codexOAuthCredentialsStoreLeavesAPIKeyAuthUnchanged() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let authURL = root.appendingPathComponent("auth.json")
+        let payload = StoredAuthPayload(
+            authMode: "api-key",
+            lastRefresh: nil,
+            tokens: nil,
+            openAIAPIKey: "sk-test"
+        )
+        try writeAuth(authURL, payload: payload)
+        let originalData = try Data(contentsOf: authURL)
+        let credentials = try CodexOAuthCredentialsStore.load(from: authURL)
+
+        try CodexOAuthCredentialsStore.writeRefreshedCredentials(
+            credentials,
+            to: authURL,
+            now: Date(timeIntervalSince1970: 1_775_606_400)
+        )
+
+        #expect(credentials.isAPIKey)
+        #expect(!CodexOAuthCredentialsStore.canRefresh(credentials))
+        #expect(try Data(contentsOf: authURL) == originalData)
+    }
+
+    @Test
     func codexStatusReaderUsesOAuthBeforeCLIFallbacks() async throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2114,6 +2256,161 @@ struct CodexStatusReaderTests {
         #expect(status.snapshot?.secondaryUsedPercent == 61)
         #expect(rpcCalls.value == 0)
         #expect(ptyCalls.value == 0)
+    }
+
+    @Test
+    func codexStatusReaderRenewsExpiredSavedTokenBeforeUsageCheck() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_775_606_400)
+        let savedAuthURL = root.appendingPathComponent("saved/team/auth.json")
+        try writeAuth(
+            savedAuthURL,
+            payload: StoredAuthPayload(
+                authMode: "chatgpt",
+                lastRefresh: "2026-04-01T00:00:00Z",
+                tokens: AuthTokens(
+                    accountID: "acct-saved",
+                    accessToken: makeAccessToken(expiration: now.addingTimeInterval(-60)),
+                    idToken: makeIDToken(
+                        accountID: "acct-saved",
+                        userID: "user-saved",
+                        email: "saved@example.com",
+                        planType: "team"
+                    ),
+                    refreshToken: "refresh-old"
+                ),
+                openAIAPIKey: nil
+            )
+        )
+
+        final class Capture: @unchecked Sendable {
+            var refreshedAccessTokens: [String] = []
+            var usageAccessTokens: [String] = []
+        }
+        let capture = Capture()
+
+        let status = try await CodexStatusReader(
+            oauthFetcher: { credentials, _ in
+                capture.usageAccessTokens.append(credentials.accessToken)
+                return CodexLiveQuotaPayload(
+                    planType: "team",
+                    snapshot: QuotaSnapshot(
+                        capturedAt: now,
+                        allowed: true,
+                        limitReached: false,
+                        primaryUsedPercent: 24,
+                        primaryResetAt: now.addingTimeInterval(300),
+                        primaryWindowMinutes: 300,
+                        secondaryUsedPercent: 61,
+                        secondaryResetAt: now.addingTimeInterval(604_800),
+                        secondaryWindowMinutes: 10_080
+                    )
+                )
+            },
+            oauthTokenRefresher: { credentials in
+                capture.refreshedAccessTokens.append(credentials.accessToken)
+                return CodexOAuthCredentials(
+                    accessToken: "access-fresh",
+                    refreshToken: "refresh-fresh",
+                    idToken: nil,
+                    accountID: credentials.accountID,
+                    lastRefresh: now
+                )
+            },
+            now: { now }
+        ).readDirectOAuthStatus(authFileURL: savedAuthURL)
+
+        let savedPayload = try JSONDecoder().decode(StoredAuthPayload.self, from: Data(contentsOf: savedAuthURL))
+        #expect(capture.refreshedAccessTokens.count == 1)
+        #expect(capture.usageAccessTokens == ["access-fresh"])
+        #expect(savedPayload.tokens?.accessToken == "access-fresh")
+        #expect(savedPayload.tokens?.refreshToken == "refresh-fresh")
+        #expect(savedPayload.tokens?.idToken != nil)
+        #expect(savedPayload.lastRefresh?.hasPrefix("2026-04-08T00:00:00") == true)
+        #expect(status.snapshot?.primaryUsedPercent == 24)
+        #expect(status.snapshot?.secondaryUsedPercent == 61)
+    }
+
+    @Test
+    func codexStatusReaderRetriesOnceAfterTokenExpiredResponse() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let now = Date(timeIntervalSince1970: 1_775_606_400)
+        let savedAuthURL = root.appendingPathComponent("saved/team/auth.json")
+        try writeAuth(
+            savedAuthURL,
+            payload: StoredAuthPayload(
+                authMode: "chatgpt",
+                lastRefresh: "2026-04-08T00:00:00Z",
+                tokens: AuthTokens(
+                    accountID: "acct-saved",
+                    accessToken: makeAccessToken(expiration: now.addingTimeInterval(3_600)),
+                    idToken: makeIDToken(
+                        accountID: "acct-saved",
+                        userID: "user-saved",
+                        email: "saved@example.com",
+                        planType: "team"
+                    ),
+                    refreshToken: "refresh-old"
+                ),
+                openAIAPIKey: nil
+            )
+        )
+
+        final class Counter: @unchecked Sendable {
+            var usageCalls = 0
+            var refreshCalls = 0
+            var usageAccessTokens: [String] = []
+        }
+        let counter = Counter()
+
+        let status = try await CodexStatusReader(
+            oauthFetcher: { credentials, _ in
+                counter.usageCalls += 1
+                counter.usageAccessTokens.append(credentials.accessToken)
+                if counter.usageCalls == 1 {
+                    throw CodexOAuthFetchError.tokenExpired
+                }
+                return CodexLiveQuotaPayload(
+                    planType: "team",
+                    snapshot: QuotaSnapshot(
+                        capturedAt: now,
+                        allowed: true,
+                        limitReached: false,
+                        primaryUsedPercent: 18,
+                        primaryResetAt: now.addingTimeInterval(300),
+                        primaryWindowMinutes: 300,
+                        secondaryUsedPercent: 40,
+                        secondaryResetAt: now.addingTimeInterval(604_800),
+                        secondaryWindowMinutes: 10_080
+                    )
+                )
+            },
+            oauthTokenRefresher: { credentials in
+                counter.refreshCalls += 1
+                return CodexOAuthCredentials(
+                    accessToken: "access-after-retry",
+                    refreshToken: "refresh-after-retry",
+                    idToken: nil,
+                    accountID: credentials.accountID,
+                    lastRefresh: now
+                )
+            },
+            now: { now }
+        ).readDirectOAuthStatus(authFileURL: savedAuthURL)
+
+        let savedPayload = try JSONDecoder().decode(StoredAuthPayload.self, from: Data(contentsOf: savedAuthURL))
+        #expect(counter.usageCalls == 2)
+        #expect(counter.refreshCalls == 1)
+        #expect(counter.usageAccessTokens.count == 2)
+        #expect(counter.usageAccessTokens[1] == "access-after-retry")
+        #expect(savedPayload.tokens?.accessToken == "access-after-retry")
+        #expect(savedPayload.tokens?.refreshToken == "refresh-after-retry")
+        #expect(status.snapshot?.primaryUsedPercent == 18)
+        #expect(status.snapshot?.secondaryUsedPercent == 40)
     }
 
     @Test
@@ -3035,6 +3332,24 @@ private func makeIDToken(accountID: String, userID: String?, email: String?, pla
             userID: userID
         )
     )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+
+    func segment<T: Encodable>(_ value: T) -> String {
+        let data = try! encoder.encode(AnyEncodable(value))
+        return data
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    return "\(segment(header)).\(segment(payload)).signature"
+}
+
+private func makeAccessToken(expiration: Date) -> String {
+    let header = ["alg": "none", "typ": "JWT"]
+    let payload = ["exp": Int(expiration.timeIntervalSince1970)]
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
 

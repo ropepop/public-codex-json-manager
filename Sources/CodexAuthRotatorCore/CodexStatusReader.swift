@@ -19,6 +19,7 @@ public enum CodexDirectStatusReaderError: LocalizedError, Sendable {
 
 public struct CodexStatusReader: Sendable {
     public typealias OAuthFetcher = @Sendable (CodexOAuthCredentials, URL) async throws -> CodexLiveQuotaPayload
+    public typealias OAuthTokenRefresher = @Sendable (CodexOAuthCredentials) async throws -> CodexOAuthCredentials
     public typealias CLIUsageFetcher = @Sendable (String, [String: String]) async throws -> CodexLiveQuotaPayload
 
     public let liveAuthURL: URL
@@ -29,8 +30,12 @@ public struct CodexStatusReader: Sendable {
     public let environment: [String: String]
 
     private let oauthFetcher: OAuthFetcher
+    private let oauthTokenRefresher: OAuthTokenRefresher
     private let cliRPCFetcher: CLIUsageFetcher
     private let cliPTYFetcher: CLIUsageFetcher
+    private let nowProvider: @Sendable () -> Date
+
+    private static let tokenRefreshLeeway: TimeInterval = 5 * 60
 
     public init(
         liveAuthURL: URL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".codex/auth.json"),
@@ -40,8 +45,10 @@ public struct CodexStatusReader: Sendable {
         codexBinary: String = "codex",
         environment: [String: String] = ProcessInfo.processInfo.environment,
         oauthFetcher: OAuthFetcher? = nil,
+        oauthTokenRefresher: OAuthTokenRefresher? = nil,
         cliRPCFetcher: CLIUsageFetcher? = nil,
-        cliPTYFetcher: CLIUsageFetcher? = nil
+        cliPTYFetcher: CLIUsageFetcher? = nil,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.liveAuthURL = liveAuthURL
         self.configURL = configURL ?? liveAuthURL.deletingLastPathComponent().appendingPathComponent("config.toml")
@@ -52,12 +59,16 @@ public struct CodexStatusReader: Sendable {
         self.oauthFetcher = oauthFetcher ?? { credentials, configURL in
             try await CodexOAuthUsageFetcher.fetchUsage(credentials: credentials, configURL: configURL)
         }
+        self.oauthTokenRefresher = oauthTokenRefresher ?? { credentials in
+            try await CodexOAuthTokenRefresher.refresh(credentials: credentials)
+        }
         self.cliRPCFetcher = cliRPCFetcher ?? { binary, environment in
             try await CodexCLIRPCUsageFetcher.fetchUsage(codexBinary: binary, environment: environment)
         }
         self.cliPTYFetcher = cliPTYFetcher ?? { binary, environment in
             try CodexCLIStatusProbe.fetchUsage(codexBinary: binary, environment: environment)
         }
+        self.nowProvider = now
     }
 
     public func readLiveStatus() async throws -> LiveCodexStatus? {
@@ -68,15 +79,11 @@ public struct CodexStatusReader: Sendable {
         let resolvedAuth = try readResolvedAuth(at: liveAuthURL)
         var planType = resolvedAuth.identity.planType
 
-        if let credentials = try? CodexOAuthCredentialsStore.parse(data: resolvedAuth.authData) {
-            if let oauthPayload = try? await oauthFetcher(credentials, configURL),
-               let liveStatus = resolvedLiveStatus(
-                accountID: resolvedAuth.identity.accountID,
-                trackingKey: resolvedAuth.identity.trackingKey,
-                email: resolvedAuth.identity.email,
-                authFingerprint: resolvedAuth.authFingerprint,
-                source: .oauth,
-                payload: oauthPayload,
+        if (try? CodexOAuthCredentialsStore.parse(data: resolvedAuth.authData)) != nil {
+            if let liveStatus = try? await readOAuthStatus(
+                authFileURL: liveAuthURL,
+                resolvedAuth: resolvedAuth,
+                overrideConfigURL: nil,
                 existingPlanType: &planType
             ) {
                 return liveStatus
@@ -126,23 +133,120 @@ public struct CodexStatusReader: Sendable {
         configURL overrideConfigURL: URL? = nil
     ) async throws -> LiveCodexStatus {
         let resolvedAuth = try readResolvedAuth(at: authFileURL)
-        let credentials = try CodexOAuthCredentialsStore.parse(data: resolvedAuth.authData)
         var planType = resolvedAuth.identity.planType
-        let oauthPayload = try await oauthFetcher(credentials, overrideConfigURL ?? configURL)
-
-        guard let liveStatus = resolvedLiveStatus(
-            accountID: resolvedAuth.identity.accountID,
-            trackingKey: resolvedAuth.identity.trackingKey,
-            email: resolvedAuth.identity.email,
-            authFingerprint: resolvedAuth.authFingerprint,
-            source: .oauth,
-            payload: oauthPayload,
+        guard let liveStatus = try await readOAuthStatus(
+            authFileURL: authFileURL,
+            resolvedAuth: resolvedAuth,
+            overrideConfigURL: overrideConfigURL,
             existingPlanType: &planType
         ) else {
             throw CodexDirectStatusReaderError.missingSnapshot
         }
 
         return liveStatus
+    }
+
+    private func readOAuthStatus(
+        authFileURL: URL,
+        resolvedAuth: ResolvedAuth,
+        overrideConfigURL: URL?,
+        existingPlanType: inout String?
+    ) async throws -> LiveCodexStatus? {
+        var prepared = try await preparedOAuthCredentials(
+            authFileURL: authFileURL,
+            resolvedAuth: resolvedAuth
+        )
+        let resolvedConfigURL = overrideConfigURL ?? configURL
+        let oauthPayload: CodexLiveQuotaPayload
+
+        do {
+            oauthPayload = try await oauthFetcher(prepared.credentials, resolvedConfigURL)
+        } catch CodexOAuthFetchError.tokenExpired {
+            prepared = try await refreshAfterExpiredToken(
+                prepared,
+                authFileURL: authFileURL
+            )
+            oauthPayload = try await oauthFetcher(prepared.credentials, resolvedConfigURL)
+        }
+
+        return resolvedLiveStatus(
+            accountID: prepared.identity.accountID,
+            trackingKey: prepared.identity.trackingKey,
+            email: prepared.identity.email,
+            authFingerprint: prepared.authFingerprint,
+            source: .oauth,
+            payload: oauthPayload,
+            existingPlanType: &existingPlanType
+        )
+    }
+
+    private func preparedOAuthCredentials(
+        authFileURL: URL,
+        resolvedAuth: ResolvedAuth
+    ) async throws -> PreparedOAuthCredentials {
+        let credentials = try CodexOAuthCredentialsStore.parse(data: resolvedAuth.authData)
+        let prepared = PreparedOAuthCredentials(
+            credentials: credentials,
+            identity: resolvedAuth.identity,
+            authFingerprint: resolvedAuth.authFingerprint,
+            didRefresh: false
+        )
+
+        guard shouldRefresh(credentials, now: nowProvider()) else {
+            return prepared
+        }
+
+        return try await refreshOAuthCredentials(
+            prepared,
+            authFileURL: authFileURL
+        )
+    }
+
+    private func refreshAfterExpiredToken(
+        _ prepared: PreparedOAuthCredentials,
+        authFileURL: URL
+    ) async throws -> PreparedOAuthCredentials {
+        guard !prepared.didRefresh else {
+            throw CodexOAuthFetchError.tokenExpired
+        }
+        guard !prepared.credentials.isAPIKey else {
+            throw CodexOAuthFetchError.tokenExpired
+        }
+        return try await refreshOAuthCredentials(
+            prepared,
+            authFileURL: authFileURL
+        )
+    }
+
+    private func refreshOAuthCredentials(
+        _ prepared: PreparedOAuthCredentials,
+        authFileURL: URL
+    ) async throws -> PreparedOAuthCredentials {
+        let refreshedCredentials = try await oauthTokenRefresher(prepared.credentials)
+        try CodexOAuthCredentialsStore.writeRefreshedCredentials(
+            refreshedCredentials,
+            to: authFileURL,
+            now: nowProvider()
+        )
+        let refreshedAuth = try readResolvedAuth(at: authFileURL)
+        guard AuthAccountMatcher.sameAccount(prepared.identity, as: refreshedAuth.identity) else {
+            throw CodexOAuthTokenRefreshError.invalidResponse("Renewed token identity did not match the saved account")
+        }
+        let persistedCredentials = try CodexOAuthCredentialsStore.parse(data: refreshedAuth.authData)
+        return PreparedOAuthCredentials(
+            credentials: persistedCredentials,
+            identity: refreshedAuth.identity,
+            authFingerprint: refreshedAuth.authFingerprint,
+            didRefresh: true
+        )
+    }
+
+    private func shouldRefresh(_ credentials: CodexOAuthCredentials, now: Date) -> Bool {
+        guard CodexOAuthCredentialsStore.canRefresh(credentials),
+              let expiresAt = CodexOAuthAccessToken.expirationDate(in: credentials.accessToken) else {
+            return false
+        }
+        return expiresAt <= now.addingTimeInterval(Self.tokenRefreshLeeway)
     }
 
     private func resolvedLiveStatus(
@@ -197,4 +301,11 @@ private struct ResolvedAuth {
     let authData: Data
     let authFingerprint: String
     let identity: ResolvedAuthIdentity
+}
+
+private struct PreparedOAuthCredentials {
+    let credentials: CodexOAuthCredentials
+    let identity: ResolvedAuthIdentity
+    let authFingerprint: String
+    let didRefresh: Bool
 }
